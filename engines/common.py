@@ -210,7 +210,7 @@ class Common(Logger):
 
         return np.mean(fpr_per_class)
 
-    def calculate_pauc_at_recall(self, y_true, y_pred_probs, recall_threshold=0.80, num_classes=101):
+    def calculate_pauc_at_recall_old(self, y_true, y_pred_probs, recall_threshold=0.80, num_classes=101):
         
         """
         Calculates the Partial AUC for multi-class classification at the given recall threshold.
@@ -242,6 +242,48 @@ class Common(Logger):
             partial_auc_value = auc(fpr, tpr)
             partial_auc_values.append(partial_auc_value)
 
+        return np.mean(partial_auc_values)
+
+
+    def calculate_pauc_at_recall(self, y_true, y_pred_probs, recall_threshold=0.80, num_classes=101, macro=1):
+
+        """
+        Calculates the Partial AUC for multi-class classification at the given recall threshold.
+        Skips classes with no true positives.
+        """
+        
+        y_true = np.asarray(y_true)
+        y_pred_probs = np.asarray(y_pred_probs)
+
+        partial_auc_values = []
+
+        for class_idx in range(num_classes):
+            y_true_bin = (y_true == class_idx).astype(int)
+            y_scores_class = y_pred_probs[:, class_idx]
+
+            # Skip class if there are no true positives
+            if macro == 1 and np.sum(y_true_bin) == 0:
+                #print(f"Skipping class {class_idx} due to no true positives.")
+                continue
+
+            fpr, tpr, _ = roc_curve(y_true_bin, y_scores_class)
+
+            max_fpr = 1 - recall_threshold
+            stop_index = np.searchsorted(fpr, max_fpr, side='right')
+
+            if stop_index < len(fpr):
+                fpr_interp_points = [fpr[stop_index - 1], fpr[stop_index]]
+                tpr_interp_points = [tpr[stop_index - 1], tpr[stop_index]]
+                tpr = np.append(tpr[:stop_index], np.interp(max_fpr, fpr_interp_points, tpr_interp_points))
+                fpr = np.append(fpr[:stop_index], max_fpr)
+            else:
+                tpr = np.append(tpr, 1.0)
+                fpr = np.append(fpr, max_fpr)
+
+            partial_auc_value = auc(fpr, tpr)
+            partial_auc_values.append(partial_auc_value)
+
+        # Return the macro-averaged Partial AUC
         return np.mean(partial_auc_values)
 
 

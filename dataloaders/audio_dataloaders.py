@@ -9,6 +9,7 @@ import torch
 import sys
 import librosa
 import torchaudio
+import numpy as np
 from torchaudio.transforms import Resample, FrequencyMasking, TimeMasking, AmplitudeToDB, PitchShift
 from torchvision.transforms import v2
 from torch.utils.data import DataLoader, Subset, Dataset
@@ -18,6 +19,8 @@ sys.path.append(os.path.abspath("../engines"))
 from engines.common import Logger
 sys.path.append(os.path.abspath("../utils"))
 from utils.classification_utils import set_seeds
+from collections import defaultdict
+from sklearn.utils.class_weight import compute_class_weight
 
 NUM_WORKERS = os.cpu_count()
 
@@ -219,7 +222,7 @@ class AudioAugmentations(Logger, torch.nn.Module):
     def __init__(
         self,
         apply_augmentation: bool=True,
-        signal: str="waveform",
+        signal: str="waveform_2",
         sample_rate: Optional[int]=None, # For pitch shifting
         n_mels: Optional[int]=None, # For frequency masking
         target_length: Optional[int]=None, # For time masking
@@ -232,7 +235,9 @@ class AudioAugmentations(Logger, torch.nn.Module):
 
         Args:
             apply_augmentation (bool): Whether to apply augmentation or not.
-            signal (str): Choose between 'waveform' (time domain) or 'spectrogram' (frequency domain).
+            signal (str): Choose between 'waveform_1', 'waveform_2' (time domain), or 'spectrogram' (frequency domain).
+                - 'waveform_1' is the same as 'waveform_2' but it does not apply time masking.
+                - 'waveform 1' is required when using spectrogram, as spectrogram already applies time masking.
             sample_rate (int, optional): Sample rate of audio (used for pitch shifting).
             n_mels (int, optional): Number of mel bands (used for frequency masking).
             target_length (int, optional): Target length for time masking.
@@ -260,7 +265,7 @@ class AudioAugmentations(Logger, torch.nn.Module):
         if not isinstance(augment_magnitude, int):
             self.error("'augment_magnitude' must be an integer.")
         
-        signal_options = ["waveform", "spectrogram"]
+        signal_options = ["waveform_1", "waveform_2", "spectrogram"]
         if not isinstance(signal, str):
             self.error("'signal' must be a string.")
         elif signal not in signal_options:
@@ -274,49 +279,47 @@ class AudioAugmentations(Logger, torch.nn.Module):
         self.hop_length = hop_length
         self.seed = seed
         self.augment_magnitude = augment_magnitude
-
+        if signal == "waveform_1":
+            self.enable_time_masking_wave = False
+            self.info("Time masking transformation disabled for waveform processing")
+        else:
+            self.enable_time_masking_wave = True
+        
     
-    def apply_pitch_shift(self, waveform, sample_rate, n_steps=1):
+    def apply_pitch_shift(self, waveform, n_steps=1):
 
         """
         Applies pitch shifting to a waveform.
 
         Args:
             waveform: The input audio waveform tensor.
-            sample_rate: The sample rate of the waveform.
             n_steps: The number of semitones to shift the pitch.
 
         Returns:
             The pitch-shifted waveform.
         """
 
-        #waveform = waveform.numpy()  # Convert from tensor to numpy array
-        #waveform_shifted = librosa.effects.pitch_shift(waveform, sr=sample_rate, n_steps=n_steps)
-        #return torch.tensor(waveform_shifted)
-        #waveform_np = waveform.detach().cpu().numpy()
-        #if waveform_np.ndim > 1:
-        #    waveform_shifted = np.stack([librosa.effects.pitch_shift(ch, sr=sample_rate, n_steps=n_steps) for ch in waveform_np])
-        #else:
-        #    waveform_shifted = librosa.effects.pitch_shift(waveform_np, sr=sample_rate, n_steps=n_steps)
-        #return torch.tensor(waveform_shifted, dtype=waveform.dtype, device=waveform.device)
-
-        # Ensure waveform is [channel, time]
+        # If waveform is empty
+        if waveform.numel() == 0:
+            return waveform
+        
+        # Ensure waveform is [channel, time]        
         if waveform.ndim == 1:
-            waveform = waveform.unsqueeze(0)  # make it [1, time]
+            waveform = waveform.unsqueeze(0)
 
-        pitch_shift = PitchShift(sample_rate=sample_rate, n_steps=n_steps)
+        # Apply pitch shifting
+        pitch_shift = PitchShift(sample_rate=self.sample_rate, n_steps=n_steps)
 
         return pitch_shift(waveform)
-
-    
-    def add_background_noise(self, waveform, noise_level=0.005):
+   
+    def add_background_noise(self, waveform, max_noise_level=0.005):
 
         """
         Adds background noise to a waveform.
 
         Args:
             waveform: The input audio waveform tensor.
-            noise_level: The level of background noise to add.
+            max_noise_level: The maximum level of background noise to add.
 
         Returns:
             The waveform with added background noise.
@@ -325,25 +328,88 @@ class AudioAugmentations(Logger, torch.nn.Module):
         if self.seed is not None:
             set_seeds(self.seed)
 
-        noise = torch.randn_like(waveform) * noise_level
+        if (noise_level := random.choice([0, max_noise_level / 2, max_noise_level])):
+            noise = torch.randn_like(waveform) * noise_level
+            return waveform + noise
 
-        return waveform + noise
+        return waveform
+    
+    def time_shift_waveform(self, waveform, max_shift=0.2):
+
+        """
+        Circularly shifts the waveform in time.
+
+        Args:
+            waveform: The input audio waveform tensor (1D or 2D if multichannel).
+            max_shift: Maximum fraction of total length to shift. 0.2 means up to ±20% shift.
+
+        Returns:
+            The time-shifted waveform tensor.
+        """
+        if self.seed is not None:
+            set_seeds(self.seed)
+
+        num_samples = waveform.shape[-1]
+        shift_samples = int(num_samples * max_shift)
+
+        # Random shift amount between -max_shift and max_shift
+        shift = torch.randint(-shift_samples, shift_samples + 1, (1,)).item()
+
+        # Circular shift (wrap-around)
+        shifted_waveform = torch.roll(waveform, shifts=shift, dims=-1)
+
+        return shifted_waveform
+    
+
+    def apply_time_mask(self, waveform, max_mask_seconds, max_num_masks):
+
+        max_mask_len = int(max_mask_seconds * self.sample_rate)
+        num_masks = random.randint(0, max_num_masks)
+
+        waveform = waveform.clone()
+
+        if num_masks > 0:    
+            for _ in range(num_masks):
+                mask_len = random.randint(int(0.5 * max_mask_len), max_mask_len)
+                start = random.randint(0, max(0, waveform.shape[-1] - mask_len))
+                waveform[..., start:start + mask_len] = 0.0
+
+        return waveform
+
     
     def apply_time_augmentation(self, waveform):
 
         """
-        Applies augmentation in the time domain (waveform).
-        Currently, only background noise is added.
+        Applies augmentation in the time domain (waveform), including:
+        - Pitch shifting
+        - Background noise
+        - Time shifting
+        - Time masking
 
         Returns:
             Tensor: Augmented waveform.
         """
+        
+        # Compute pitch shift
+        pitch_shift_max = max(0, min(2, int(0.5 * self.augment_magnitude)))
+        if pitch_shift_max > 0:
+            pitch_shift = random.choice(range(-pitch_shift_max, pitch_shift_max + 1))
+            if pitch_shift != 0:
+                waveform = self.apply_pitch_shift(waveform, n_steps=pitch_shift)
 
-        #pitch_shift = 1 * self.augment_magnitude
-        background_noise = 0.0025 * self.augment_magnitude
+        # Apply background noise
+        max_noise_level = 0.0010 * self.augment_magnitude
+        waveform = self.add_background_noise(waveform, max_noise_level=max_noise_level)
 
-        #waveform = self.apply_pitch_shift(waveform, sample_rate=self.sample_rate, n_steps=pitch_shift)
-        waveform = self.add_background_noise(waveform, noise_level=background_noise)
+        # Apply time shifting
+        max_shift = 0.2 * self.augment_magnitude
+        waveform = self.time_shift_waveform(waveform, max_shift=max_shift)
+
+        # Apply time masking
+        if self.enable_time_masking_wave:
+            max_mask_seconds = 0.1 * self.augment_magnitude
+            max_num_masks = self.augment_magnitude 
+            waveform = self.apply_time_mask(waveform, max_mask_seconds=max_mask_seconds, max_num_masks=max_num_masks)
 
         return waveform
     
@@ -380,7 +446,7 @@ class AudioAugmentations(Logger, torch.nn.Module):
 
         if not self.apply_augmentation:
             return x
-        elif self.signal == "waveform":
+        elif self.signal in ("waveform_1", "waveform_2"):
             return self.apply_time_augmentation(x)
         else:
             return self.apply_freq_augmentation(x)
@@ -453,7 +519,8 @@ class AudioWaveformTransforms(Logger, torch.nn.Module):
             # Apply time augmentation
             AudioAugmentations(
                 apply_augmentation=self.augmentation,
-                signal="waveform",
+                signal="waveform_2",
+                sample_rate=self.new_sample_rate,
                 seed=self.seed,
                 augment_magnitude=self.augment_magnitude)
         )        
@@ -625,7 +692,8 @@ class AudioSpectrogramTransforms(Logger, torch.nn.Module):
             # Apply time augmentation
             AudioAugmentations(
                 apply_augmentation=self.augmentation,
-                signal="waveform",
+                signal="waveform_1",
+                sample_rate=self.new_sample_rate,
                 seed=self.seed,
                 augment_magnitude=self.augment_magnitude)
         )        
@@ -640,6 +708,7 @@ class AudioSpectrogramTransforms(Logger, torch.nn.Module):
             AudioAugmentations(
                 apply_augmentation=self.augmentation,
                 signal="spectrogram",
+                sample_rate=self.new_sample_rate,
                 n_mels=self.n_mels,
                 target_length=self.target_length,
                 hop_length=self.hop_length,
@@ -1114,9 +1183,56 @@ class AudioSpectrogramTransforms(Logger, torch.nn.Module):
         return x
 
 
+# Helper to get dataset and raw indices
+def get_full_dataset_and_indices(dataset):
+    if isinstance(dataset, Subset):
+        return dataset.dataset, dataset.indices
+    else:
+        return dataset, list(range(len(dataset)))
 
+def class_resample(
+    dataset: Dataset,
+    samples_per_class: int
+    ):
+
+    logger = Logger()
+    # Get full dataset and its indices (handles Subset vs Dataset)
+    if isinstance(dataset, Subset):
+        full_dataset, full_indices = dataset.dataset, dataset.indices
+    else:
+        full_dataset, full_indices = dataset, list(range(len(dataset)))
+    logger.info(f"Total indices: {len(full_indices)}")
+
+    # Create a mapping from class label to list of sample indices
+    class_to_indices = defaultdict(list)
+    for idx in full_indices:
+        label = full_dataset.labels[idx]
+        class_to_indices[label].append(idx)
+    logger.info(f"Found {len(class_to_indices)} classes.")
+
+    # Compute number of samples to select per class
+    samples_per_class = max(1, int(samples_per_class))
+    logger.info(f"Targeting {samples_per_class} samples per class.")
+
+    # Sample indices per class to maintain class distribution
+    selected_indices = []
+    for label, indices in class_to_indices.items():
+        if len(indices) < samples_per_class:
+            # If the class has fewer samples than samples_per_class, upsample            
+            upsampled_indices = random.choices(indices, k=samples_per_class)
+            selected_indices.extend(upsampled_indices)
+        else:
+            # Otherwise, sample without replacement
+            downsampled_indices = random.sample(indices, samples_per_class)            
+            selected_indices.extend(downsampled_indices)    
+    logger.info(f"Total selected training samples: {len(selected_indices)}")
+
+    # Create a subset with selected stratified indices
+    return Subset(full_dataset, selected_indices)
+
+        
 # Function to create DataLoaders
-def create_dataloaders_waveform(
+def create_dataloaders(
     train_dir: str,
     test_dir: str,
     train_transform=None,
@@ -1137,8 +1253,8 @@ def create_dataloaders_waveform(
         test_dir (str): Path to the testing dataset directory.
         train_transform (callable, optional): Transformation function for training data.
         test_transform (callable, optional): Transformation function for testing data.
-        num_train_samples (int, optional): Number of training samples to randomly select. If None, use all.
-        num_test_samples (int, optional): Number of testing samples to randomly select. If None, use all.
+        num_train_samples_class (int, optional): Number of training samples to randomly select. If None, use all.
+        num_test_samples_class (int, optional): Number of testing samples to randomly select. If None, use all.
         batch_size (int): Batch size for the DataLoader. Default is 32.
         num_workers (int): Number of worker threads for data loading. Default is 4.
         random_seed (int): Seed for random operations to ensure reproducibility. Default is 42.
@@ -1148,34 +1264,55 @@ def create_dataloaders_waveform(
             - train_dataloader (DataLoader): DataLoader for training data.
             - test_dataloader (DataLoader): DataLoader for testing data.
             - class_names (list): List of class labels present in the training dataset.
+            - class_weights (list): List of class weights to be applied to the cost function
     """
 
+    logger = Logger()
+
+    # Set random seed
     random.seed(random_seed)
 
-    # Create datasets
+    # Instantiate training and testing datasets
     train_data = AudioDataset(root_dir=train_dir, transform=train_transform)
     test_data = AudioDataset(root_dir=test_dir, transform=test_transform)
 
-    # Extract class names
-    class_names = train_data.classes  
+    # Extract class labels from training dataset
+    class_names = train_data.classes
+    num_classes = len(class_names)
 
     # Resample training data if num_train_samples is specified
-    if num_train_samples is not None:
-        train_indices = random.sample(range(len(train_data)), k=min(num_train_samples, len(train_data)))
-        train_data = Subset(train_data, train_indices)
+    #if num_train_samples is not None:
+    #    train_indices = random.sample(range(len(train_data)), k=min(num_train_samples, len(train_data)))
+    #    train_data = Subset(train_data, train_indices)
 
     # Resample testing data if num_test_samples is specified
-    if num_test_samples is not None:
-        test_indices = random.sample(range(len(test_data)), k=min(num_test_samples, len(test_data)))
-        test_data = Subset(test_data, test_indices)
+    #if num_test_samples is not None:
+    #    test_indices = random.sample(range(len(test_data)), k=min(num_test_samples, len(test_data)))
+    #    test_data = Subset(test_data, test_indices)
 
-    # Create DataLoaders
+    # Stratified Sampling for TRAIN SET
+    if num_train_samples is not None:
+
+        logger.info("Processing training dataset...")
+
+        samples_per_class = max(1, num_train_samples // num_classes)
+        train_data = class_resample(train_data, samples_per_class)
+
+    # Stratified Sampling for TEST SET
+    if num_test_samples is not None:
+        
+        logger.info("Processing test dataset...")
+
+        samples_per_class = max(1, num_test_samples // num_classes)
+        test_data = class_resample(test_data, samples_per_class)
+
+    # Create PyTorch DataLoaders
     train_dataloader = DataLoader(
         train_data,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=pad_collate_fn  
+        collate_fn=pad_collate_fn
     )
 
     test_dataloader = DataLoader(
@@ -1183,82 +1320,24 @@ def create_dataloaders_waveform(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=pad_collate_fn  
+        collate_fn=pad_collate_fn
     )
 
-    return train_dataloader, test_dataloader, class_names
-
-
-
-    # Function to create DataLoaders
-def create_dataloaders_spectrogram(
-    train_dir: str,
-    test_dir: str,
-    train_transform=None,
-    test_transform=None,
-    num_train_samples: int = None,
-    num_test_samples: int = None,
-    batch_size: int = 32,
-    num_workers: int = 4,
-    random_seed: int = 42
-):
-
-    """ 
-    Function to create DataLoaders for training and testing audio data. This function already aligns the lengths
-    of the audio waveforms.
-
-    Args:
-        train_dir (str): Path to the training dataset directory.
-        test_dir (str): Path to the testing dataset directory.
-        train_transform (callable, optional): Transformation function for training data.
-        test_transform (callable, optional): Transformation function for testing data.
-        num_train_samples (int, optional): Number of training samples to randomly select. If None, use all.
-        num_test_samples (int, optional): Number of testing samples to randomly select. If None, use all.
-        batch_size (int): Batch size for the DataLoader. Default is 32.
-        num_workers (int): Number of worker threads for data loading. Default is 4.
-        random_seed (int): Seed for random operations to ensure reproducibility. Default is 42.
-
-    Returns:
-        tuple: (train_dataloader, test_dataloader, class_names)
-            - train_dataloader (DataLoader): DataLoader for training data.
-            - test_dataloader (DataLoader): DataLoader for testing data.
-            - class_names (list): List of class labels present in the training dataset.
-    """
-
-    random.seed(random_seed)
-
-    # Create datasets
-    train_data = AudioDataset(root_dir=train_dir, transform=train_transform)
-    test_data = AudioDataset(root_dir=test_dir, transform=test_transform)
-
-    # Extract class names
-    class_names = train_data.classes  
-
-    # Resample training data if num_train_samples is specified
-    if num_train_samples is not None:
-        train_indices = random.sample(range(len(train_data)), k=min(num_train_samples, len(train_data)))
-        train_data = Subset(train_data, train_indices)
-
-    # Resample testing data if num_test_samples is specified
-    if num_test_samples is not None:
-        test_indices = random.sample(range(len(test_data)), k=min(num_test_samples, len(test_data)))
-        test_data = Subset(test_data, test_indices)
-
-    # Create dataloaders
-    train_dataloader = DataLoader(
-        train_data,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True, #enables fast data transfer to CUDA-enable GPU
-    )
-    test_dataloader = DataLoader(
-        test_data,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True, #enables fast data transfer to CUDA-enable GPU
-    )
-
-    return train_dataloader, test_dataloader, class_names
-
+    # Compute class weights
+    try:        
+        # Resampling (subset)
+        indices = train_dataloader.dataset.indices
+        all_labels = train_dataloader.dataset.dataset.labels
+        labels = [all_labels[i] for i in indices]
+    
+    except AttributeError:
+        # No resampling
+        labels = train_dataloader.dataset.labels
+        
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(labels),
+        y=labels
+        )
+    #class_weights = []
+    return train_dataloader, test_dataloader, class_names, class_weights
